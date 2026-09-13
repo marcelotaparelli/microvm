@@ -308,6 +308,10 @@ msb run \
   -v "$PROJECT_CACHE:/root/.cache" \
   -w /workspace \
   -e TERM=xterm-256color \
+  -e LANG=C.UTF-8 \
+  -e LC_ALL=C.UTF-8 \
+  -e PAGER=cat \
+  -e GIT_PAGER=cat \
   -e BUN_INSTALL=/root/.bun \
   -e XDG_CONFIG_HOME=/root/.config \
   -e XDG_DATA_HOME=/root/.local/share \
@@ -324,6 +328,23 @@ msb run \
       /root/.local/share \
       /root/.local/state \
       /root/.cache
+
+    # --------------------------------------------------------
+    # Base development tools
+    # --------------------------------------------------------
+
+    if ! command -v git >/dev/null 2>&1 ||
+       ! command -v less >/dev/null 2>&1; then
+
+    apt-get update -qq
+
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -qq \
+      ca-certificates \
+      git \
+      less \
+      >/dev/null
+    fi
 
     # --------------------------------------------------------
     # OpenCode installation
