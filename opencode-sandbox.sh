@@ -25,15 +25,15 @@ set -Eeuo pipefail
 #   state/opencode/<project>  -> sessões/config/cache isolados
 #
 # stop:
-#   mantém tudo
+#   mantém VM + state + sessões
 #
 # recreate:
-#   remove e recria somente a VM
-#   mantém state/sessões
+#   recria somente a VM
+#   mantém state + sessões
 #
 # purge:
-#   remove VM + state/sessões
-#   mantém código + Bun + chave no .env
+#   remove VM + state + sessões
+#   mantém código + Bun + chave do .env
 # ============================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +50,16 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+# Aceita o nome antigo que já usamos e também o nome oficial.
+#
+# Preferência:
+#   OPENCODE_API_KEY
+# fallback:
+#   OPENCODE_ZEN_KEY
+#
+# Dentro da VM SEMPRE será OPENCODE_API_KEY.
+OPENCODE_API_KEY_EFFECTIVE="${OPENCODE_API_KEY:-${OPENCODE_ZEN_KEY:-}}"
+
 # ------------------------------------------------------------
 # Action
 # ------------------------------------------------------------
@@ -64,6 +74,7 @@ case "${1:-}" in
 
   rm)
     echo "O comando 'rm' foi removido por segurança." >&2
+    echo >&2
     echo "Use:" >&2
     echo "  stop      -> preservar sessão" >&2
     echo "  recreate  -> recriar VM preservando sessão" >&2
@@ -81,12 +92,28 @@ HOST_PORT="${2:-3000}"
 
 if [[ ! "$PROJECT_NAME" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   echo "Erro: nome de projeto inválido: $PROJECT_NAME" >&2
+  echo "Use somente letras, números, '.', '_' e '-'." >&2
   exit 1
 fi
 
 if [[ ! "$HOST_PORT" =~ ^[0-9]+$ ]] ||
    (( HOST_PORT < 1 || HOST_PORT > 65535 )); then
+
   echo "Erro: porta inválida: $HOST_PORT" >&2
+  exit 1
+fi
+
+if [[ -z "$OPENCODE_API_KEY_EFFECTIVE" ]]; then
+  echo "Erro: nenhuma chave do OpenCode Zen foi encontrada." >&2
+  echo >&2
+  echo "Defina uma destas variáveis em:" >&2
+  echo "  $ENV_FILE" >&2
+  echo >&2
+  echo "  OPENCODE_API_KEY=..." >&2
+  echo >&2
+  echo "ou mantenha a compatibilidade atual:" >&2
+  echo >&2
+  echo "  OPENCODE_ZEN_KEY=..." >&2
   exit 1
 fi
 
@@ -106,6 +133,8 @@ PROJECT_CONFIG="$PROJECT_STATE/.config"
 PROJECT_LOCAL="$PROJECT_STATE/.local"
 PROJECT_CACHE="$PROJECT_STATE/.cache"
 
+# Bun + OpenCode CLI compartilhados entre VMs.
+# Sessões NÃO ficam aqui.
 SHARED_BUN="$BASE_DIR/.bun"
 
 # ------------------------------------------------------------
@@ -119,7 +148,7 @@ CONTAINER_PORT="3000"
 
 IMAGE="oven/bun:1-debian"
 
-CUSTOM_PATH="/root/.bun/install/global/node_modules/.bin:/root/.bun/install/global/node_modules/opencode-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+CUSTOM_PATH="/root/.bun/install/global/node_modules/.bin:/root/.bun/install/global/node_modules/opencode-linux-x64/bin:/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ------------------------------------------------------------
 # Helpers
@@ -149,7 +178,7 @@ remove_state() {
 
     *)
       echo "ERRO: caminho inseguro:" >&2
-      echo "$PROJECT_STATE" >&2
+      echo "  $PROJECT_STATE" >&2
       exit 1
       ;;
   esac
@@ -175,6 +204,7 @@ case "$ACTION" in
     if vm_exists; then
       echo "Parando VM: $VM_NAME"
       msb stop "$VM_NAME"
+
       echo
       echo "State preservado:"
       echo "  $PROJECT_STATE"
@@ -202,7 +232,7 @@ case "$ACTION" in
     echo "Preservado:"
     echo "  código: $PROJECT_DIR"
     echo "  Bun:    $SHARED_BUN"
-    echo "  .env:   $ENV_FILE"
+    echo "  chave:  $ENV_FILE"
     echo
 
     exit 0
@@ -231,16 +261,6 @@ mkdir -p \
   "$PROJECT_LOCAL/state" \
   "$PROJECT_CACHE" \
   "$SHARED_BUN"
-
-# ------------------------------------------------------------
-# OpenCode authentication
-# ------------------------------------------------------------
-
-if [[ -z "${OPENCODE_ZEN_KEY:-}" ]]; then
-  echo "Aviso: OPENCODE_ZEN_KEY não definida em:"
-  echo "  $ENV_FILE"
-  echo
-fi
 
 # ------------------------------------------------------------
 # Existing VM
@@ -273,6 +293,7 @@ echo "State:   $PROJECT_STATE"
 echo "CPU:     $CPUS"
 echo "Memória: $MEMORY"
 echo "Porta:   localhost:$HOST_PORT -> VM:$CONTAINER_PORT"
+echo "Auth:    OPENCODE_API_KEY carregada"
 echo
 
 msb run \
@@ -293,7 +314,7 @@ msb run \
   -e XDG_STATE_HOME=/root/.local/state \
   -e XDG_CACHE_HOME=/root/.cache \
   -e PATH="$CUSTOM_PATH" \
-  -e OPENCODE_ZEN_KEY="${OPENCODE_ZEN_KEY:-}" \
+  -e OPENCODE_API_KEY="$OPENCODE_API_KEY_EFFECTIVE" \
   "$IMAGE" \
   -- /bin/bash -c '
     set -Eeuo pipefail
@@ -304,14 +325,31 @@ msb run \
       /root/.local/state \
       /root/.cache
 
-    if [[ -n "${OPENCODE_ZEN_KEY:-}" ]]; then
-      if ! opencode auth login \
-        --provider opencode-zen \
-        --api-key "$OPENCODE_ZEN_KEY" \
-        >/dev/null 2>&1; then
+    # --------------------------------------------------------
+    # OpenCode installation
+    #
+    # /root/.bun é persistente, então normalmente isso só
+    # acontece na primeira execução.
+    # --------------------------------------------------------
 
-        echo "Aviso: login automático do OpenCode falhou." >&2
-      fi
+    if ! command -v opencode >/dev/null 2>&1; then
+      echo "OpenCode não encontrado. Instalando com Bun..."
+
+      bun install -g opencode-ai
+    fi
+
+    # --------------------------------------------------------
+    # Authentication
+    #
+    # Não executamos opencode auth login.
+    #
+    # O provider interno "opencode" lê OPENCODE_API_KEY
+    # diretamente do ambiente.
+    # --------------------------------------------------------
+
+    if [[ -z "${OPENCODE_API_KEY:-}" ]]; then
+      echo "ERRO: OPENCODE_API_KEY não chegou à VM." >&2
+      exit 1
     fi
 
     cd /workspace
