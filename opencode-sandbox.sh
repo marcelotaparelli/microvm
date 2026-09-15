@@ -14,6 +14,8 @@ set -Eeuo pipefail
 #   ./opencode-sandbox.sh stop portfolio
 #   ./opencode-sandbox.sh recreate portfolio 3000
 #   ./opencode-sandbox.sh purge portfolio
+#   ./opencode-sandbox.sh doctor
+#   ./opencode-sandbox.sh cleanup
 #
 # Overrides:
 #   MSB_MEMORY=6G MSB_CPUS=4 ./opencode-sandbox.sh portfolio 3000
@@ -34,6 +36,14 @@ set -Eeuo pipefail
 # purge:
 #   remove VM + state + sessões
 #   mantém código + Bun + chave do .env
+#
+# doctor:
+#   somente leitura; mostra RAM/disco/VMs/caches
+#
+# cleanup:
+#   limpa cache de pacotes do Bun
+#   limpa cache reconstruível do microsandbox somente sem VMs registradas
+#   preserva projetos, state, toolchains e autenticação
 # ============================================================
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,7 +77,7 @@ OPENCODE_API_KEY_EFFECTIVE="${OPENCODE_API_KEY:-${OPENCODE_ZEN_KEY:-}}"
 ACTION="run"
 
 case "${1:-}" in
-  run|status|stop|recreate|purge)
+  run|status|stop|recreate|purge|doctor|cleanup|help)
     ACTION="$1"
     shift
     ;;
@@ -79,11 +89,14 @@ case "${1:-}" in
     echo "  stop      -> preservar sessão" >&2
     echo "  recreate  -> recriar VM preservando sessão" >&2
     echo "  purge     -> apagar definitivamente o state" >&2
+    echo "  doctor    -> diagnosticar uso de disco/RAM/caches" >&2
+    echo "  cleanup   -> limpar caches compartilhados seguros" >&2
     exit 1
     ;;
 esac
 
-PROJECT_NAME="${1:-app}"
+RAW_PROJECT_NAME="${1:-app}"
+PROJECT_NAME="${RAW_PROJECT_NAME#opencode-}"
 HOST_PORT="${2:-3000}"
 
 # ------------------------------------------------------------
@@ -103,18 +116,20 @@ if [[ ! "$HOST_PORT" =~ ^[0-9]+$ ]] ||
   exit 1
 fi
 
-if [[ -z "$OPENCODE_API_KEY_EFFECTIVE" ]]; then
-  echo "Erro: nenhuma chave do OpenCode Zen foi encontrada." >&2
-  echo >&2
-  echo "Defina uma destas variáveis em:" >&2
-  echo "  $ENV_FILE" >&2
-  echo >&2
-  echo "  OPENCODE_API_KEY=..." >&2
-  echo >&2
-  echo "ou mantenha a compatibilidade atual:" >&2
-  echo >&2
-  echo "  OPENCODE_ZEN_KEY=..." >&2
-  exit 1
+if [[ "$ACTION" == "run" || "$ACTION" == "recreate" ]]; then
+  if [[ -z "$OPENCODE_API_KEY_EFFECTIVE" ]]; then
+    echo "Erro: nenhuma chave do OpenCode Zen foi encontrada." >&2
+    echo >&2
+    echo "Defina uma destas variáveis em:" >&2
+    echo "  $ENV_FILE" >&2
+    echo >&2
+    echo "  OPENCODE_API_KEY=..." >&2
+    echo >&2
+    echo "ou mantenha a compatibilidade atual:" >&2
+    echo >&2
+    echo "  OPENCODE_ZEN_KEY=..." >&2
+    exit 1
+  fi
 fi
 
 # ------------------------------------------------------------
@@ -155,14 +170,43 @@ CUSTOM_PATH="/root/.bun/install/global/node_modules/.bin:/root/.bun/install/glob
 # ------------------------------------------------------------
 
 vm_exists() {
-  msb list 2>/dev/null | grep -Fq "$VM_NAME"
+  msb list 2>/dev/null | awk -v name="$VM_NAME" '
+    NR > 1 && $1 == name { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+show_vm() {
+  msb list 2>/dev/null | awk -v name="$VM_NAME" '
+    NR == 1 || $1 == name
+  '
 }
 
 remove_vm() {
-  if vm_exists; then
-    echo "Removendo VM: $VM_NAME"
-    msb rm -f "$VM_NAME" >/dev/null 2>&1 || true
+  if ! vm_exists; then
+    echo "VM não encontrada: $VM_NAME"
+    return 0
   fi
+
+  echo "Removendo VM: $VM_NAME"
+
+  # Parar antes de remover torna o comportamento previsível entre
+  # VMs running e stopped. Falha ao parar uma VM já parada é aceitável.
+  msb stop "$VM_NAME" >/dev/null 2>&1 || true
+
+  # Não esconda falhas de remoção. O antigo `|| true` fazia o script
+  # anunciar sucesso mesmo quando a VM permanecia em `msb list`.
+  if ! msb rm "$VM_NAME"; then
+    echo "ERRO: msb não conseguiu remover a VM: $VM_NAME" >&2
+    return 1
+  fi
+
+  if vm_exists; then
+    echo "ERRO: a VM ainda existe após a remoção: $VM_NAME" >&2
+    return 1
+  fi
+
+  echo "VM removida: $VM_NAME"
 }
 
 remove_state() {
@@ -185,14 +229,219 @@ remove_state() {
 }
 
 # ------------------------------------------------------------
+# Storage hygiene
+# ------------------------------------------------------------
+
+MICROSANDBOX_DIR="$HOME/.microsandbox"
+MICROSANDBOX_CACHE="$MICROSANDBOX_DIR/cache"
+BUN_CACHE="$BASE_DIR/.bun/install/cache"
+
+# Alert thresholds. Override per invocation if desired:
+#   BUN_CACHE_WARN_GB=8 MSB_CACHE_WARN_GB=8 ./... doctor
+BUN_CACHE_WARN_GB="${BUN_CACHE_WARN_GB:-5}"
+MSB_CACHE_WARN_GB="${MSB_CACHE_WARN_GB:-5}"
+
+dir_kb() {
+  local path="$1"
+
+  if [[ -e "$path" ]]; then
+    du -sk "$path" 2>/dev/null | awk '{print $1}'
+  else
+    echo 0
+  fi
+}
+
+human_kb() {
+  local kb="${1:-0}"
+
+  awk -v kb="$kb" '
+    BEGIN {
+      if (kb >= 1024 * 1024) {
+        printf "%.1f GiB", kb / (1024 * 1024)
+      } else if (kb >= 1024) {
+        printf "%.1f MiB", kb / 1024
+      } else {
+        printf "%d KiB", kb
+      }
+    }
+  '
+}
+
+has_any_vm() {
+  msb list 2>/dev/null | awk '
+    NR > 1 && NF > 0 && $1 != "No" { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+warn_dir_size() {
+  local label="$1"
+  local path="$2"
+  local limit_gb="$3"
+  local kb
+  local limit_kb
+
+  kb="$(dir_kb "$path")"
+  limit_kb=$(( limit_gb * 1024 * 1024 ))
+
+  if (( kb >= limit_kb )); then
+    echo
+    echo "AVISO DE DISCO:"
+    echo "  $label: $(human_kb "$kb")"
+    echo "  caminho: $path"
+    echo "  limite:  ${limit_gb} GiB"
+    echo
+    echo "Use:"
+    echo "  $0 doctor"
+    echo "  $0 cleanup"
+    echo
+  fi
+}
+
+warn_storage() {
+  warn_dir_size "cache compartilhado do Bun" "$BUN_CACHE" "$BUN_CACHE_WARN_GB"
+  warn_dir_size "cache do microsandbox" "$MICROSANDBOX_CACHE" "$MSB_CACHE_WARN_GB"
+}
+
+doctor_report() {
+  echo
+  echo "=== SANDBOX DOCTOR ==="
+  echo
+
+  echo "--- Disco ---"
+  df -h / 2>/dev/null || true
+
+  echo
+  echo "--- RAM ---"
+  free -h 2>/dev/null || true
+
+  echo
+  echo "--- Microsandbox VMs ---"
+  msb list 2>/dev/null || true
+
+  echo
+  echo "--- Uso do ambiente ---"
+  printf "%-32s %s\n" "sandboxes:" "$(human_kb "$(dir_kb "$HOME/sandboxes")")"
+  printf "%-32s %s\n" "projects:" "$(human_kb "$(dir_kb "$BASE_DIR/projects")")"
+  printf "%-32s %s\n" "state:" "$(human_kb "$(dir_kb "$BASE_DIR/state")")"
+  printf "%-32s %s\n" "Bun compartilhado:" "$(human_kb "$(dir_kb "$BASE_DIR/.bun")")"
+  printf "%-32s %s\n" "cache Bun:" "$(human_kb "$(dir_kb "$BUN_CACHE")")"
+  printf "%-32s %s\n" "Codex global:" "$(human_kb "$(dir_kb "$BASE_DIR/.npm-global")")"
+  printf "%-32s %s\n" "microsandbox:" "$(human_kb "$(dir_kb "$MICROSANDBOX_DIR")")"
+  printf "%-32s %s\n" "cache microsandbox:" "$(human_kb "$(dir_kb "$MICROSANDBOX_CACHE")")"
+
+  warn_storage
+}
+
+clear_dir_contents() {
+  local path="$1"
+
+  [[ -d "$path" ]] || return 0
+
+  # find evita problemas de glob com diretórios vazios e arquivos ocultos.
+  find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+
+cleanup_shared_caches() {
+  local before_bun
+  local before_msb
+  local after_bun
+  local after_msb
+  local freed_kb
+
+  before_bun="$(dir_kb "$BUN_CACHE")"
+  before_msb="$(dir_kb "$MICROSANDBOX_CACHE")"
+
+  echo
+  echo "CLEANUP DE CACHES COMPARTILHADOS"
+  echo
+  echo "Preservado:"
+  echo "  projetos"
+  echo "  state/sessões dos projetos"
+  echo "  Bun/OpenCode instalados globalmente"
+  echo "  Codex instalado globalmente"
+  echo "  autenticação"
+  echo
+
+  if [[ -d "$BUN_CACHE" ]]; then
+    echo "Limpando cache de pacotes do Bun:"
+    echo "  $BUN_CACHE"
+    clear_dir_contents "$BUN_CACHE"
+  else
+    echo "Cache do Bun não existe."
+  fi
+
+  echo
+
+  # Layers podem estar referenciadas por VMs paradas. Só removemos cache
+  # do microsandbox quando não existe nenhuma VM registrada.
+  if has_any_vm; then
+    echo "Cache do microsandbox NÃO foi apagado."
+    echo "Motivo: existem VMs registradas em 'msb list'."
+    echo "Remova/purge VMs que não usa e execute cleanup novamente."
+  elif [[ -d "$MICROSANDBOX_CACHE" ]]; then
+    echo "Nenhuma VM registrada."
+    echo "Limpando cache reconstruível do microsandbox:"
+    echo "  $MICROSANDBOX_CACHE"
+    clear_dir_contents "$MICROSANDBOX_CACHE"
+  else
+    echo "Cache do microsandbox não existe."
+  fi
+
+  after_bun="$(dir_kb "$BUN_CACHE")"
+  after_msb="$(dir_kb "$MICROSANDBOX_CACHE")"
+
+  freed_kb=$(( before_bun + before_msb - after_bun - after_msb ))
+  if (( freed_kb < 0 )); then
+    freed_kb=0
+  fi
+
+  echo
+  echo "Espaço liberado nesta limpeza: $(human_kb "$freed_kb")"
+  echo
+  df -h / 2>/dev/null || true
+  echo
+}
+
+# ------------------------------------------------------------
 # Administrative actions
 # ------------------------------------------------------------
 
 case "$ACTION" in
 
+  help)
+    echo "Uso:"
+    echo "  $0 <projeto> [portas...]"
+    echo "  $0 run <projeto> [portas...]"
+    echo "  $0 status <projeto>"
+    echo "  $0 stop <projeto>"
+    echo "  $0 recreate <projeto> [portas...]"
+    echo "  $0 purge <projeto>"
+    echo "  $0 doctor"
+    echo "  $0 cleanup"
+    echo
+    echo "Política:"
+    echo "  stop      preserva VM/state/sessões"
+    echo "  recreate  recria a VM e preserva state/sessões"
+    echo "  purge     remove VM + state do projeto; preserva código/toolchain/auth"
+    echo "  doctor    somente leitura; mostra RAM, disco, VMs e caches"
+    echo "  cleanup   remove caches reconstruíveis; não remove projetos/auth/toolchain"
+    exit 0
+    ;;
+
+  doctor)
+    doctor_report
+    exit 0
+    ;;
+
+  cleanup)
+    cleanup_shared_caches
+    exit 0
+    ;;
+
   status)
     if vm_exists; then
-      msb list | grep -F "$VM_NAME" || true
+      show_vm
     else
       echo "VM não encontrada: $VM_NAME"
     fi
@@ -218,14 +467,20 @@ case "$ACTION" in
   purge)
     echo
     echo "PURGE: $PROJECT_NAME"
+    echo "VM:    $VM_NAME"
     echo
 
     remove_vm
     remove_state
 
+    if vm_exists; then
+      echo "ERRO: purge abortado; a VM ainda existe: $VM_NAME" >&2
+      exit 1
+    fi
+
     echo
     echo "Removido:"
-    echo "  VM"
+    echo "  VM: $VM_NAME"
     echo "  sessões"
     echo "  config/cache daquele agente"
     echo
@@ -234,6 +489,8 @@ case "$ACTION" in
     echo "  Bun:    $SHARED_BUN"
     echo "  chave:  $ENV_FILE"
     echo
+
+    warn_storage
 
     exit 0
     ;;
@@ -278,12 +535,15 @@ if vm_exists; then
 fi
 
 if vm_exists; then
+  warn_storage
   exec msb exec "$VM_NAME" -- /bin/bash
 fi
 
 # ------------------------------------------------------------
 # New VM
 # ------------------------------------------------------------
+
+warn_storage
 
 echo
 echo "Criando sandbox: $VM_NAME"
